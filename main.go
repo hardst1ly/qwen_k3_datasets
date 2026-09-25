@@ -1,9 +1,11 @@
 // TrayTranslator — утилита-переводчик в системном трее.
 //
-// Alt+E в любом приложении → копирует выделенный текст (с сохранением и
-// восстановлением буфера обмена) → открывает Google Translate в браузере по
-// умолчанию с уже подставленным текстом. Никаких API-ключей и внешних
-// сервисов: только открытие URL.
+// Написали сообщение (например, «Привет») → нажали Alt+E → текст в поле сам
+// выделяется, переводится в фоне (Google Translate, без браузера и без
+// API-ключей) и заменяется переводом («Hello»). Буфер обмена сохраняется и
+// восстанавливается. Все переводы запоминаются в translator-memory.json:
+// повторные фразы переводятся мгновенно и без интернета, а исправления,
+// внесённые в этот файл, используются в следующих переводах.
 //
 // Сборка (подробности — в README.md):
 //
@@ -93,11 +95,11 @@ static void tt_key(INPUT *in, WORD vk, DWORD flags) {
 	in->ki.dwFlags = flags;
 }
 
-// Эмуляция Ctrl+C через SendInput.
+// Эмуляция Ctrl+<key> (key = 'A', 'C' или 'V') через SendInput.
 // Если вызвано по хоткею — сначала «маскируем» Alt (иначе его отпускание
 // активирует меню окна) и дожидаемся отпускания Alt/E, чтобы не получилось
 // Ctrl+Alt+C.
-static int tt_send_copy(int fromHotkey) {
+static int tt_send_combo(int key, int fromHotkey) {
 	INPUT in[8];
 	int n = 0;
 	if (fromHotkey) {
@@ -112,8 +114,8 @@ static int tt_send_copy(int fromHotkey) {
 		if (tt_is_down(VK_RMENU)) tt_key(&in[n++], VK_RMENU, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY);
 	}
 	tt_key(&in[n++], VK_CONTROL, 0);
-	tt_key(&in[n++], 'C', 0);
-	tt_key(&in[n++], 'C', KEYEVENTF_KEYUP);
+	tt_key(&in[n++], (WORD)key, 0);
+	tt_key(&in[n++], (WORD)key, KEYEVENTF_KEYUP);
 	tt_key(&in[n++], VK_CONTROL, KEYEVENTF_KEYUP);
 	return SendInput(n, in, sizeof(INPUT)) == (UINT)n ? 1 : 0;
 }
@@ -234,6 +236,29 @@ static char *tt_clip_text(void) {
 	return out;
 }
 
+// Положить текст (UTF-8) в буфер для вставки. Помечаем его форматом
+// ExcludeClipboardContentFromMonitorProcessing, чтобы временный перевод не
+// попадал в журнал буфера обмена Windows (Win+V).
+static int tt_clip_set_text(const char *utf8) {
+	int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+	if (n <= 0) return 0;
+	HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)n * sizeof(WCHAR));
+	if (!h) return 0;
+	WCHAR *w = (WCHAR *)GlobalLock(h);
+	if (!w) { GlobalFree(h); return 0; }
+	MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, n);
+	GlobalUnlock(h);
+	if (!tt_open_clip()) { GlobalFree(h); return 0; }
+	EmptyClipboard();
+	int ok = SetClipboardData(CF_UNICODETEXT, h) != NULL;
+	if (!ok) GlobalFree(h);
+	UINT ex = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
+	HGLOBAL e = ex ? GlobalAlloc(GMEM_MOVEABLE, 1) : NULL;
+	if (e && !SetClipboardData(ex, e)) GlobalFree(e);
+	CloseClipboard();
+	return ok;
+}
+
 // Восстановление снимка. После успешного SetClipboardData память принадлежит системе.
 static void tt_clip_restore(void *p) {
 	tt_clip_snap *s = (tt_clip_snap *)p;
@@ -268,21 +293,6 @@ static int tt_balloon(const char *title, const char *msg) {
 	MultiByteToWideChar(CP_UTF8, 0, title, -1, nid.szInfoTitle, 63);
 	MultiByteToWideChar(CP_UTF8, 0, msg, -1, nid.szInfo, 255);
 	return Shell_NotifyIconW(NIM_MODIFY, &nid) ? 1 : 0;
-}
-
-// Открытие URL в браузере по умолчанию (ShellExecute, без мигания консоли).
-static int tt_open_url(const char *url) {
-	int n = MultiByteToWideChar(CP_UTF8, 0, url, -1, NULL, 0);
-	if (n <= 0) return 0;
-	WCHAR *w = (WCHAR *)malloc((size_t)n * sizeof(WCHAR));
-	if (!w) return 0;
-	MultiByteToWideChar(CP_UTF8, 0, url, -1, w, n);
-	HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-	AllowSetForegroundWindow(ASFW_ANY); // браузер может выйти на передний план
-	HINSTANCE r = ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
-	if (SUCCEEDED(hr)) CoUninitialize();
-	free(w);
-	return (INT_PTR)r > 32;
 }
 
 // Пункт меню трея забирает фокус себе. Возвращаем фокус окну, которое
@@ -322,9 +332,9 @@ static void *tt_clip_save(void) { return NULL; }
 static void tt_clip_clear(void) {}
 static unsigned int tt_clip_seq(void) { return 0; }
 static char *tt_clip_text(void) { return NULL; }
+static int tt_clip_set_text(const char *s) { (void)s; return 0; }
 static void tt_clip_restore(void *p) { (void)p; }
 static int tt_balloon(const char *t, const char *m) { (void)t; (void)m; return 0; }
-static int tt_open_url(const char *u) { (void)u; return 0; }
 static int tt_focus_prev(void) { return 0; }
 
 #endif
@@ -405,12 +415,14 @@ static int tt_ax_trusted(int prompt) {
 	return ok ? 1 : 0;
 }
 
-// Cmd+C. Флаги события задаются явно, поэтому зажатый Option не мешает.
-static int tt_send_copy(int fromHotkey) {
+// Cmd+<key> ('A', 'C', 'V'). Флаги события задаются явно, поэтому зажатый
+// Option не мешает.
+static int tt_send_combo(int key, int fromHotkey) {
 	(void)fromHotkey;
+	CGKeyCode kc = key == 'A' ? 0 : key == 'V' ? 9 : 8; // kVK_ANSI_A / V / C
 	CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-	CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)8, true);  // kVK_ANSI_C
-	CGEventRef up = CGEventCreateKeyboardEvent(src, (CGKeyCode)8, false);
+	CGEventRef down = CGEventCreateKeyboardEvent(src, kc, true);
+	CGEventRef up = CGEventCreateKeyboardEvent(src, kc, false);
 	int ok = down && up;
 	if (ok) {
 		CGEventSetFlags(down, kCGEventFlagMaskCommand);
@@ -510,8 +522,8 @@ static int tt_hotkey_wait(void) {
 	}
 }
 
-// ---- Эмуляция Ctrl+C через XTest ----
-static int tt_send_copy(int fromHotkey) {
+// ---- Эмуляция Ctrl+<key> ('A', 'C', 'V') через XTest ----
+static int tt_send_combo(int key, int fromHotkey) {
 	if (!tt_load_x11()) return 0;
 	if (!xtst) xtst = dlopen("libXtst.so.6", RTLD_LAZY);
 	if (!xtst) return 0;
@@ -529,7 +541,7 @@ static int tt_send_copy(int fromHotkey) {
 	if (!pQuery(d, &a, &b, &c, &e)) { pClose(d); return 0; }
 
 	unsigned int kCtrl = pK2C(d, 0xffe3); // XK_Control_L
-	unsigned int kC    = pK2C(d, 0x0063); // XK_c
+	unsigned int kC    = pK2C(d, (unsigned long)(key | 0x20)); // XK_a / XK_c / XK_v
 	unsigned int kAltL = pK2C(d, 0xffe9); // XK_Alt_L
 	unsigned int kAltR = pK2C(d, 0xffea); // XK_Alt_R
 	unsigned int kE    = pK2C(d, 0x0065); // XK_e
@@ -564,20 +576,25 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"math"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unsafe"
 
 	"fyne.io/systray"
@@ -586,12 +603,18 @@ import (
 )
 
 const (
-	appTitle      = "Переводчик"
-	configName    = "translator-config.json"
-	defaultLang   = "ru"
-	copyTimeout   = 300 * time.Millisecond // сколько ждём, пока приложение отдаст текст по Ctrl+C
-	maxTextRunes  = 5000                   // лимит Google Translate на один запрос
-	maxEncodedLen = 14000                  // ограничение длины URL (сервер Google и командная строка)
+	appTitle       = "Переводчик"
+	configName     = "translator-config.json"
+	memoryName     = "translator-memory.json"
+	defaultLang    = "en"
+	defaultNative  = "ru"
+	selTimeout     = 200 * time.Millisecond // ждём текст после Ctrl+C, если что-то выделено
+	copyTimeout    = 300 * time.Millisecond // ждём текст после Ctrl+A, Ctrl+C
+	pasteSettle    = 450 * time.Millisecond // даём приложению забрать перевод из буфера до восстановления
+	httpTimeout    = 10 * time.Second
+	maxTextRunes   = 5000  // лимит Google Translate на один запрос
+	maxChunkEncLen = 6000  // длина закодированного текста в одном GET-запросе
+	maxMemEntries  = 20000 // размер памяти переводов
 )
 
 // ---------------------------------------------------------------------
@@ -620,22 +643,30 @@ func langName(code string) string {
 	return code
 }
 
+// Сравнение языков без учёта региона: "zh-CN" ~ "zh", "en" ~ "en-US".
+func sameLang(a, b string) bool {
+	base := func(s string) string { return strings.ToLower(strings.SplitN(s, "-", 2)[0]) }
+	return a != "" && b != "" && base(a) == base(b)
+}
+
 // ---------------------------------------------------------------------
 // Конфиг: JSON рядом с исполняемым файлом
 // ---------------------------------------------------------------------
 
 type config struct {
-	TargetLang string `json:"target_lang"`
+	TargetLang string `json:"target_lang"` // на какой язык переводить
+	NativeLang string `json:"native_lang"` // «мой язык»: сюда переводится текст, уже написанный на target_lang
 }
 
 var (
 	cfgMu    sync.Mutex
-	cfg      = config{TargetLang: defaultLang}
+	cfg      = config{TargetLang: defaultLang, NativeLang: defaultNative}
 	cfgPath  string
 	firstRun bool
 
 	busy      sync.Mutex // защита от повторного срабатывания во время перевода
 	langItems []*systray.MenuItem
+	mMemInfo  *systray.MenuItem
 )
 
 // Путь к конфигу: рядом с бинарником; если папка недоступна для записи
@@ -670,6 +701,8 @@ func dirWritable(dir string) bool {
 
 func loadConfig() {
 	cfgPath = resolveConfigPath()
+	mem.path = filepath.Join(filepath.Dir(cfgPath), memoryName)
+	mem.load()
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		firstRun = true
@@ -677,30 +710,49 @@ func loadConfig() {
 		return
 	}
 	var c config
-	if json.Unmarshal(data, &c) == nil && langName(c.TargetLang) != c.TargetLang {
-		cfg = c
+	if json.Unmarshal(data, &c) == nil {
+		if langName(c.TargetLang) != c.TargetLang {
+			cfg.TargetLang = c.TargetLang
+		}
+		if c.NativeLang != "" {
+			cfg.NativeLang = c.NativeLang
+		}
 	}
+	saveConfig() // дописываем новые поля в старый конфиг
 }
 
 func saveConfig() {
 	cfgMu.Lock()
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	cfgMu.Unlock()
-	_ = os.MkdirAll(filepath.Dir(cfgPath), 0o755)
-	tmp := cfgPath + ".tmp"
-	if os.WriteFile(tmp, append(data, '\n'), 0o644) == nil {
-		if os.Rename(tmp, cfgPath) != nil {
-			_ = os.WriteFile(cfgPath, append(data, '\n'), 0o644)
+	writeFileAtomic(cfgPath, append(data, '\n'))
+}
+
+func writeFileAtomic(path string, data []byte) {
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, data, 0o644) == nil {
+		if os.Rename(tmp, path) != nil {
+			_ = os.WriteFile(path, data, 0o644)
 			os.Remove(tmp)
 		}
 	}
 }
 
-func currentLang() string {
+func currentLangs() (target, native string) {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
-	return cfg.TargetLang
+	target, native = cfg.TargetLang, cfg.NativeLang
+	if sameLang(native, target) { // «обратный» язык не может совпадать с целевым
+		native = "en"
+		if sameLang(target, "en") {
+			native = "ru"
+		}
+	}
+	return
 }
+
+func currentLang() string { t, _ := currentLangs(); return t }
 
 // ---------------------------------------------------------------------
 // Точка входа
@@ -716,9 +768,9 @@ func main() {
 			translateSelection(true)
 			return
 		case "--help", "-h", "/?":
-			fmt.Println("TrayTranslator — переводчик выделенного текста (Alt+E).\n" +
+			fmt.Println("TrayTranslator — перевод текста в поле ввода по Alt+E (с заменой на месте).\n" +
 				"  без аргументов   запуск в системном трее\n" +
-				"  --translate, -t  перевести выделенный текст один раз и выйти")
+				"  --translate, -t  перевести один раз и выйти")
 			return
 		}
 	}
@@ -738,13 +790,18 @@ func onReady() {
 	systray.SetIcon(trayIcon())
 	systray.SetTooltip(tooltip())
 
-	mTranslate := systray.AddMenuItem("Перевести выделенное", "Перевести выделенный текст (Alt+E)")
+	mTranslate := systray.AddMenuItem("Перевести и заменить (Alt+E)", "Перевести текст в активном поле и вставить перевод")
 	mLang := systray.AddMenuItem("Язык перевода", "Выбор языка, на который переводить")
-	cur := currentLang()
+	target := currentLang()
 	for _, l := range languages {
-		item := mLang.AddSubMenuItemCheckbox(fmt.Sprintf("%s (%s)", l.Name, l.Code), "", l.Code == cur)
+		item := mLang.AddSubMenuItemCheckbox(fmt.Sprintf("%s (%s)", l.Name, l.Code), "", l.Code == target)
 		langItems = append(langItems, item)
 	}
+	systray.AddSeparator()
+	mMemInfo = systray.AddMenuItem(memInfoTitle(), "Сколько фраз переводчик уже запомнил")
+	mMemInfo.Disable()
+	mMemOpen := systray.AddMenuItem("Открыть память (исправить перевод)", "Открыть файл памяти в редакторе: можно поправить любой перевод")
+	mMemClear := systray.AddMenuItem("Очистить память", "Забыть все выученные фразы")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Выход", "Закрыть переводчик")
 
@@ -761,6 +818,19 @@ func onReady() {
 		}(i)
 	}
 	go func() {
+		for range mMemOpen.ClickedCh {
+			mem.save()
+			openInEditor(mem.path)
+		}
+	}()
+	go func() {
+		for range mMemClear.ClickedCh {
+			mem.clear()
+			updateMemInfo()
+			notify(appTitle, "Память переводов очищена.")
+		}
+	}()
+	go func() {
 		<-mQuit.ClickedCh
 		systray.Quit()
 	}()
@@ -768,12 +838,22 @@ func onReady() {
 	go registerHotkey()
 
 	if firstRun {
-		notify(appTitle, "Работаю в трее. Выделите текст и нажмите Alt+E.\nЯзык перевода: "+langName(currentLang()))
+		notify(appTitle, "Напишите сообщение и нажмите Alt+E — текст заменится переводом.\nЯзык перевода: "+langName(currentLang()))
 	}
 }
 
 func tooltip() string {
 	return appTitle + " (Alt+E) → " + langName(currentLang())
+}
+
+func memInfoTitle() string {
+	return fmt.Sprintf("Выучено фраз: %d", mem.size())
+}
+
+func updateMemInfo() {
+	if mMemInfo != nil {
+		mMemInfo.SetTitle(memInfoTitle())
+	}
 }
 
 // Смена языка: галочка, сохранение в конфиг, уведомление.
@@ -955,7 +1035,7 @@ func portalHotkey() error {
 }
 
 // ---------------------------------------------------------------------
-// Логика перевода
+// Логика: Alt+E → (выделить) → скопировать → перевести → вставить на место
 // ---------------------------------------------------------------------
 
 func translateFromMenu() {
@@ -973,75 +1053,127 @@ func translateSelection(fromHotkey bool) {
 	}
 	defer busy.Unlock()
 
-	text := strings.TrimSpace(copySelection(fromHotkey))
-	if text == "" {
-		return // ничего не выделено — молча выходим
+	// 1. Сохраняем буфер обмена; вернём его в конце в любом случае.
+	restore := clipSave()
+	defer restore()
+
+	// 2–5. Берём выделенный текст, а если ничего не выделено — весь текст поля.
+	text, manual := grabText(fromHotkey)
+	if strings.TrimSpace(text) == "" {
+		return // поле пустое / приложение не отдаёт текст — молча выходим
 	}
-	openURL(buildURL(text, currentLang()))
+
+	// 6. Перевод: сначала память, затем Google (в фоне, без браузера).
+	res, err := translate(text)
+	if err != nil {
+		notify(appTitle, "Не удалось перевести: "+err.Error())
+		return
+	}
+	if res.Text == "" || res.Text == text {
+		return
+	}
+
+	// 7. Вставляем перевод поверх выделения (Ctrl+V).
+	if clipSetText(res.Text) && sendKeys('V', false) {
+		time.Sleep(pasteSettle)
+	}
+	// Текст был выделен вручную (например, входящее сообщение, которое
+	// нельзя заменить) — дополнительно показываем перевод в уведомлении.
+	if manual {
+		notify(appTitle+" → "+langName(res.Lang), truncateRunes(res.Text, 200))
+	}
 }
 
-// Сохранить буфер → очистить → Ctrl+C → дождаться текста (≤300 мс) → восстановить буфер.
-func copySelection(fromHotkey bool) string {
-	if runtime.GOOS == "windows" {
-		return copySelectionWindows(fromHotkey)
+// Сначала пробуем Ctrl+C (вдруг пользователь что-то выделил). Если пусто —
+// Ctrl+A, Ctrl+C: выделяем весь текст в поле ввода.
+func grabText(fromHotkey bool) (text string, manual bool) {
+	seq := clipClear()
+	if !sendKeys('C', fromHotkey) {
+		return "", false
 	}
+	if t := clipWaitText(seq, selTimeout); strings.TrimSpace(t) != "" {
+		return t, true
+	}
+	if !sendKeys('A', false) {
+		return "", false
+	}
+	time.Sleep(40 * time.Millisecond)
+	seq = clipClear()
+	if !sendKeys('C', false) {
+		return "", false
+	}
+	return clipWaitText(seq, copyTimeout), false
+}
 
-	// 1. Сохраняем текущее содержимое буфера.
-	orig, origErr := clipboard.ReadAll()
-	// 2. Очищаем буфер.
-	_ = clipboard.WriteAll("")
-	// 3–5. Ctrl+C / Cmd+C и ожидание текста с таймаутом.
-	text := ""
-	if sendCopy(fromHotkey) {
-		deadline := time.Now().Add(copyTimeout)
-		for time.Now().Before(deadline) {
-			time.Sleep(25 * time.Millisecond)
-			if s, err := clipboard.ReadAll(); err == nil && s != "" {
-				text = s
-				break
-			}
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// ---------------------------------------------------------------------
+// Буфер обмена (Windows — нативно через cgo, Linux/macOS — atotto/clipboard)
+// ---------------------------------------------------------------------
+
+// Снимок буфера; возвращает функцию восстановления.
+func clipSave() func() {
+	if runtime.GOOS == "windows" {
+		snap := C.tt_clip_save() // все форматы: текст, картинки, файлы, RTF…
+		return func() { C.tt_clip_restore(snap) }
+	}
+	orig, err := clipboard.ReadAll()
+	return func() {
+		if err == nil {
+			_ = clipboard.WriteAll(orig)
 		}
 	}
-	// 6. Восстанавливаем исходное содержимое.
-	if origErr == nil {
-		_ = clipboard.WriteAll(orig)
-	}
-	return text
 }
 
-func copySelectionWindows(fromHotkey bool) string {
-	// Окно с правами администратора: SendInput будет заблокирован UIPI.
-	if C.tt_foreground_elevated() == 1 {
-		notify(appTitle, "Активное окно запущено от имени администратора — Windows блокирует копирование. Запустите переводчик от администратора.")
-		return ""
+// Очистка буфера; возвращает номер версии буфера (Windows) для отслеживания изменений.
+func clipClear() uint32 {
+	if runtime.GOOS == "windows" {
+		C.tt_clip_clear()
+		return uint32(C.tt_clip_seq())
 	}
-	// 1. Снимок всех форматов буфера (текст, картинки, файлы, RTF...).
-	snap := C.tt_clip_save()
-	// 2. Очистка буфера.
-	C.tt_clip_clear()
-	seq := C.tt_clip_seq()
-	// 3. Ctrl+C через SendInput.
-	text := ""
-	if C.tt_send_copy(boolToC(fromHotkey)) == 1 {
-		// 4–5. Ждём появления текста, но не дольше 300 мс (не зависаем).
-		deadline := time.Now().Add(copyTimeout)
-		for time.Now().Before(deadline) {
+	_ = clipboard.WriteAll("")
+	return 0
+}
+
+// Ждём, пока приложение положит текст в буфер, но не дольше timeout.
+func clipWaitText(seq uint32, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if runtime.GOOS == "windows" {
 			time.Sleep(15 * time.Millisecond)
-			if C.tt_clip_seq() == seq {
+			if uint32(C.tt_clip_seq()) == seq {
 				continue
 			}
 			if p := C.tt_clip_text(); p != nil {
-				text = C.GoString(p)
+				s := C.GoString(p)
 				C.free(unsafe.Pointer(p))
-				if text != "" {
-					break
+				if s != "" {
+					return s
 				}
 			}
+			continue
+		}
+		time.Sleep(25 * time.Millisecond)
+		if s, err := clipboard.ReadAll(); err == nil && s != "" {
+			return s
 		}
 	}
-	// 6. Восстановление исходного содержимого буфера.
-	C.tt_clip_restore(snap)
-	return text
+	return ""
+}
+
+func clipSetText(s string) bool {
+	if runtime.GOOS == "windows" {
+		cs := C.CString(s)
+		defer C.free(unsafe.Pointer(cs))
+		return C.tt_clip_set_text(cs) == 1
+	}
+	return clipboard.WriteAll(s) == nil
 }
 
 func boolToC(b bool) C.int {
@@ -1051,28 +1183,30 @@ func boolToC(b bool) C.int {
 	return 0
 }
 
-// Эмуляция копирования на Linux/macOS с fallback для Wayland.
-func sendCopy(fromHotkey bool) bool {
-	if runtime.GOOS == "darwin" {
-		return C.tt_send_copy(boolToC(fromHotkey)) == 1
+// Эмуляция Ctrl+<key> (macOS: Cmd+<key>), key = 'A', 'C' или 'V'.
+func sendKeys(key byte, fromHotkey bool) bool {
+	if runtime.GOOS != "linux" && runtime.GOOS != "freebsd" && runtime.GOOS != "openbsd" {
+		return C.tt_send_combo(C.int(key), boolToC(fromHotkey)) == 1 // SendInput / CGEvent
 	}
+	lower := string(rune(key | 0x20))
 	if isWayland() {
 		if fromHotkey {
 			time.Sleep(150 * time.Millisecond) // даём отпустить Alt+E
 		}
-		// ydotool (uinput, нужен запущенный ydotoold): 29 = LeftCtrl, 46 = C.
-		if runCmd("ydotool", "key", "29:1", "46:1", "46:0", "29:0") {
+		// ydotool (uinput, нужен запущенный ydotoold): 29 = LeftCtrl, 30 = A, 46 = C, 47 = V.
+		code := map[byte]string{'A': "30", 'C': "46", 'V': "47"}[key]
+		if runCmd("ydotool", "key", "29:1", code+":1", code+":0", "29:0") {
 			return true
 		}
 		// wtype — для wlroots-композиторов (Sway, Hyprland).
-		if runCmd("wtype", "-M", "ctrl", "c", "-m", "ctrl") {
+		if runCmd("wtype", "-M", "ctrl", lower, "-m", "ctrl") {
 			return true
 		}
 	}
-	if C.tt_send_copy(boolToC(fromHotkey)) == 1 { // XTest (X11 / XWayland)
+	if C.tt_send_combo(C.int(key), boolToC(fromHotkey)) == 1 { // XTest (X11 / XWayland)
 		return true
 	}
-	return runCmd("xdotool", "key", "--clearmodifiers", "ctrl+c")
+	return runCmd("xdotool", "key", "--clearmodifiers", "ctrl+"+lower)
 }
 
 func runCmd(name string, args ...string) bool {
@@ -1095,39 +1229,408 @@ func runCmd(name string, args ...string) bool {
 	}
 }
 
-// URL Google Translate: sl=auto — автоопределение, tl — целевой язык, op=translate.
-func buildURL(text, lang string) string {
-	r := []rune(text)
-	if len(r) > maxTextRunes {
-		r = r[:maxTextRunes]
-	}
-	enc := func(rs []rune) string { return strings.ReplaceAll(url.QueryEscape(string(rs)), "+", "%20") }
-	e := enc(r)
-	for len(e) > maxEncodedLen && len(r) > 1 {
-		r = r[:len(r)*9/10]
-		e = enc(r)
-	}
-	return "https://translate.google.com/?sl=auto&tl=" + url.QueryEscape(lang) + "&text=" + e + "&op=translate"
-}
-
-// Открыть URL в браузере по умолчанию.
-func openURL(u string) {
-	switch runtime.GOOS {
-	case "windows":
-		cs := C.CString(u)
-		C.tt_open_url(cs)
-		C.free(unsafe.Pointer(cs))
-	case "darwin":
-		startDetached("open", u)
-	default:
-		startDetached("xdg-open", u)
-	}
-}
-
 func startDetached(name string, args ...string) {
 	cmd := exec.Command(name, args...)
 	if cmd.Start() == nil {
 		go cmd.Wait()
+	}
+}
+
+// Открыть файл памяти в текстовом редакторе.
+func openInEditor(path string) {
+	switch runtime.GOOS {
+	case "windows":
+		startDetached("notepad.exe", path)
+	case "darwin":
+		startDetached("open", "-t", path)
+	default:
+		startDetached("xdg-open", path)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Перевод: память → Google Translate (фоновый HTTP-запрос, без ключей)
+// ---------------------------------------------------------------------
+
+type trResult struct {
+	Text       string
+	Lang       string // язык результата
+	FromMemory bool
+}
+
+type segment struct{ Dst, Src string }
+
+func translate(text string) (trResult, error) {
+	target, native := currentLangs()
+	if r := []rune(text); len(r) > maxTextRunes {
+		text = string(r[:maxTextRunes])
+	}
+
+	// Память: «Привет» → «Hello» без сети и мгновенно. Сначала прямое
+	// направление, затем обратное (текст уже на target — переводим на native).
+	mem.reloadIfChanged()
+	if t, ok := mem.lookup(target, text); ok {
+		return trResult{t, target, true}, nil
+	}
+	if t, ok := mem.lookup(native, text); ok {
+		return trResult{t, native, true}, nil
+	}
+
+	segs, src, err := googleTranslate(text, target)
+	if err != nil {
+		return trResult{}, err
+	}
+	lang := target
+	// Текст уже на целевом языке (например, входящее сообщение на английском) —
+	// переводим его на «мой» язык.
+	if sameLang(src, target) {
+		if s2, _, err2 := googleTranslate(text, native); err2 == nil {
+			segs, lang = s2, native
+		}
+	}
+	var b strings.Builder
+	for _, s := range segs {
+		b.WriteString(s.Dst)
+	}
+	out := b.String()
+	// Сохраняем пробелы/переводы строк по краям, как в исходнике.
+	out = leadingSpace(text) + strings.TrimSpace(out) + trailingSpace(text)
+
+	mem.learn(lang, text, out, segs)
+	updateMemInfo()
+	return trResult{out, lang, false}, nil
+}
+
+func leadingSpace(s string) string  { return s[:len(s)-len(strings.TrimLeftFunc(s, unicode.IsSpace))] }
+func trailingSpace(s string) string { return s[len(strings.TrimRightFunc(s, unicode.IsSpace)):] }
+
+var (
+	httpClient     = &http.Client{Timeout: httpTimeout}
+	googleEndpoint = "https://translate.googleapis.com/translate_a/single"
+)
+
+// Неофициальный бесплатный эндпоинт Google Translate (client=gtx).
+// Ответ: [[["Hello. ","Привет. ",...],["How are you?","Как дела?",...]],null,"ru",...]
+func googleTranslate(text, tl string) ([]segment, string, error) {
+	var all []segment
+	src := ""
+	for _, chunk := range splitChunks(text) {
+		q := url.Values{}
+		q.Set("client", "gtx")
+		q.Set("sl", "auto")
+		q.Set("tl", tl)
+		q.Set("dt", "t")
+		q.Set("ie", "UTF-8")
+		q.Set("oe", "UTF-8")
+		q.Set("q", chunk)
+		req, _ := http.NewRequest("GET", googleEndpoint+"?"+q.Encode(), nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, "", errors.New("нет соединения с Google")
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, "", errors.New("Google временно ограничил запросы, попробуйте позже")
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, "", fmt.Errorf("Google ответил %d", resp.StatusCode)
+		}
+		segs, lang, err := parseGoogle(body)
+		if err != nil {
+			return nil, "", err
+		}
+		if src == "" {
+			src = lang
+		}
+		all = append(all, segs...)
+	}
+	return all, src, nil
+}
+
+func parseGoogle(body []byte) ([]segment, string, error) {
+	var raw []any
+	if err := json.Unmarshal(body, &raw); err != nil || len(raw) == 0 {
+		return nil, "", errors.New("непонятный ответ Google")
+	}
+	var segs []segment
+	if arr, ok := raw[0].([]any); ok {
+		for _, it := range arr {
+			seg, ok := it.([]any)
+			if !ok || len(seg) < 2 {
+				continue
+			}
+			dst, _ := seg[0].(string)
+			src, _ := seg[1].(string)
+			if dst != "" || src != "" {
+				segs = append(segs, segment{dst, src})
+			}
+		}
+	}
+	lang := ""
+	if len(raw) > 2 {
+		lang, _ = raw[2].(string)
+	}
+	if len(segs) == 0 {
+		return nil, "", errors.New("пустой ответ Google")
+	}
+	return segs, lang, nil
+}
+
+// Делим длинный текст на куски по границам предложений, чтобы URL не был слишком длинным.
+func splitChunks(text string) []string {
+	if len(url.QueryEscape(text)) <= maxChunkEncLen {
+		return []string{text}
+	}
+	var chunks []string
+	cur := ""
+	for _, s := range splitSentences(text) {
+		if cur != "" && len(url.QueryEscape(cur+s)) > maxChunkEncLen {
+			chunks = append(chunks, cur)
+			cur = ""
+		}
+		cur += s
+	}
+	if cur != "" {
+		chunks = append(chunks, cur)
+	}
+	return chunks
+}
+
+// Разбивка на предложения; каждое включает хвостовые пробелы/переводы строк.
+func splitSentences(s string) []string {
+	rs := []rune(s)
+	var out []string
+	start := 0
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		end := r == '\n' || strings.ContainsRune("。！？", r) ||
+			(strings.ContainsRune(".!?…", r) && (i+1 == len(rs) || unicode.IsSpace(rs[i+1])))
+		if !end {
+			continue
+		}
+		j := i + 1
+		for j < len(rs) && unicode.IsSpace(rs[j]) {
+			j++
+		}
+		out = append(out, string(rs[start:j]))
+		start = j
+		i = j - 1
+	}
+	if start < len(rs) {
+		out = append(out, string(rs[start:]))
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------
+// Память переводов («обучение»): JSON рядом с exe
+//
+// Каждый переведённый текст и каждое его предложение запоминаются. В
+// следующий раз «Привет» → «Hello» берётся из памяти мгновенно и без сети;
+// длинное сообщение собирается из уже известных предложений. Файл можно
+// открыть из меню и поправить перевод руками — программа сразу подхватит
+// исправление и будет использовать его.
+// ---------------------------------------------------------------------
+
+type memEntry struct {
+	Lang  string `json:"lang"` // язык перевода
+	Src   string `json:"src"`
+	Dst   string `json:"dst"`
+	Uses  int    `json:"uses"`
+	Last  string `json:"last"`
+	key   string
+	stamp time.Time
+}
+
+type memFile struct {
+	Version int         `json:"version"`
+	Entries []*memEntry `json:"entries"`
+}
+
+type memory struct {
+	mu      sync.Mutex
+	path    string
+	entries map[string]*memEntry
+	modTime time.Time
+}
+
+var mem = &memory{entries: map[string]*memEntry{}}
+
+// Ключ: язык + текст без учёта регистра и лишних пробелов.
+func memKey(lang, s string) string {
+	return lang + "\x00" + strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
+
+func (m *memory) size() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.entries)
+}
+
+func (m *memory) load() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.loadLocked()
+}
+
+func (m *memory) loadLocked() {
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		return
+	}
+	var f memFile
+	if json.Unmarshal(data, &f) != nil {
+		return // файл повреждён при ручной правке — оставляем то, что в памяти
+	}
+	m.entries = map[string]*memEntry{}
+	for _, e := range f.Entries {
+		if e == nil || strings.TrimSpace(e.Src) == "" || e.Lang == "" {
+			continue
+		}
+		e.key = memKey(e.Lang, e.Src)
+		e.stamp, _ = time.Parse(time.RFC3339, e.Last)
+		m.entries[e.key] = e
+	}
+	if st, err := os.Stat(m.path); err == nil {
+		m.modTime = st.ModTime()
+	}
+}
+
+// Файл поправили руками — перечитываем.
+func (m *memory) reloadIfChanged() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if st, err := os.Stat(m.path); err == nil && !st.ModTime().Equal(m.modTime) {
+		m.loadLocked()
+	}
+}
+
+func (m *memory) touch(e *memEntry) {
+	e.Uses++
+	e.stamp = time.Now()
+	e.Last = e.stamp.UTC().Format(time.RFC3339)
+}
+
+// Поиск целого текста, а если его нет — сборка из известных предложений.
+func (m *memory) lookup(lang, text string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.entries[memKey(lang, text)]; ok && e.Dst != "" {
+		m.touch(e)
+		go m.save()
+		return leadingSpace(text) + strings.TrimSpace(e.Dst) + trailingSpace(text), true
+	}
+	parts := splitSentences(text)
+	if len(parts) < 2 {
+		return "", false
+	}
+	var b strings.Builder
+	var used []*memEntry
+	for _, p := range parts {
+		body := strings.TrimSpace(p)
+		if body == "" {
+			b.WriteString(p)
+			continue
+		}
+		e, ok := m.entries[memKey(lang, body)]
+		if !ok || e.Dst == "" {
+			return "", false
+		}
+		used = append(used, e)
+		b.WriteString(leadingSpace(p) + strings.TrimSpace(e.Dst) + trailingSpace(p))
+	}
+	for _, e := range used {
+		m.touch(e)
+	}
+	go m.save()
+	return b.String(), true
+}
+
+func (m *memory) put(lang, src, dst string) {
+	src, dst = strings.TrimSpace(src), strings.TrimSpace(dst)
+	if src == "" || dst == "" || strings.EqualFold(src, dst) {
+		return
+	}
+	k := memKey(lang, src)
+	e, ok := m.entries[k]
+	if !ok {
+		e = &memEntry{Lang: lang, Src: src, key: k}
+		m.entries[k] = e
+	}
+	e.Dst = dst
+	m.touch(e)
+}
+
+// Запоминаем весь текст и каждое предложение отдельно.
+func (m *memory) learn(lang, src, dst string, segs []segment) {
+	m.mu.Lock()
+	m.put(lang, src, dst)
+	if len(segs) > 1 {
+		for _, s := range segs {
+			m.put(lang, s.Src, s.Dst)
+		}
+	}
+	m.evictLocked()
+	m.mu.Unlock()
+	go m.save()
+}
+
+// Ограничиваем размер: выбрасываем редко используемые и давние записи.
+func (m *memory) evictLocked() {
+	if len(m.entries) <= maxMemEntries {
+		return
+	}
+	list := make([]*memEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		list = append(list, e)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Uses != list[j].Uses {
+			return list[i].Uses < list[j].Uses
+		}
+		return list[i].stamp.Before(list[j].stamp)
+	})
+	for _, e := range list[:len(list)-maxMemEntries] {
+		delete(m.entries, e.key)
+	}
+}
+
+func (m *memory) clear() {
+	m.mu.Lock()
+	m.entries = map[string]*memEntry{}
+	m.mu.Unlock()
+	m.save()
+}
+
+var memSaveMu sync.Mutex
+
+func (m *memory) save() {
+	memSaveMu.Lock()
+	defer memSaveMu.Unlock()
+	m.mu.Lock()
+	list := make([]*memEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		list = append(list, e)
+	}
+	m.mu.Unlock()
+	// Сортировка: самые используемые сверху — так файл удобнее править руками.
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Uses != list[j].Uses {
+			return list[i].Uses > list[j].Uses
+		}
+		return list[i].Src < list[j].Src
+	})
+	data, err := json.MarshalIndent(memFile{Version: 1, Entries: list}, "", "  ")
+	if err != nil {
+		return
+	}
+	writeFileAtomic(m.path, append(data, '\n'))
+	if st, err := os.Stat(m.path); err == nil {
+		m.mu.Lock()
+		m.modTime = st.ModTime()
+		m.mu.Unlock()
 	}
 }
 

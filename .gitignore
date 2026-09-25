@@ -3,4 +3,5 @@
 /traytranslator
 /TrayTranslator
 translator-config.json
+translator-memory.json
 *.tmp
