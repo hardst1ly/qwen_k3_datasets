@@ -1,0 +1,6 @@
+# локальные артефакты
+/TrayTranslator.exe
+/traytranslator
+/TrayTranslator
+translator-config.json
+*.tmp
